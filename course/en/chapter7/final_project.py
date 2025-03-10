@@ -163,26 +163,33 @@ def get_rouge_scores(model, dataset, tokenizer, device, body_key="body", summary
         return {k: v*100 for k, v in result.items()}
     return {k: v.mid.fmeasure * 100 for k, v in result.items()}
 
+from transformers import Seq2SeqTrainer
+
+# Define a custom trainer that filters out the extra keyword argument
+class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # Remove the 'num_items_in_batch' key if present to prevent errors
+        kwargs.pop("num_items_in_batch", None)
+        return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
 def train_lora(base_model, dataset, tokenizer, model_repo_id, body_key="body", summary_key="summary", num_epochs=2, skip_if_hf_exists=True):
     from huggingface_hub.utils import RepositoryNotFoundError
 
-    # --- Check if model already exists on Hugging Face Hub ---
-    # if skip_if_hf_exists:
-    #     api = HfApi()
-    #     try:
-    #         info = api.repo_info(model_repo_id, repo_type="model")
-    #         print(f"\n[Skipping Training?] {model_repo_id} found on HF. Checking for adapter config...")
-    #         loaded_lora_model = PeftModel.from_pretrained(base_model, model_repo_id)
-    #         print(f"Found LoRA adapter in {model_repo_id}, skipping training.")
-    #         device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
-    #         loaded_lora_model.to(device)
-    #         return loaded_lora_model
-    #     except RepositoryNotFoundError:
-    #         print(f"No HF repo found for {model_repo_id}, proceeding with training...")
-    #     except OSError as e:
-    #         print(f"HF repo {model_repo_id} found, but no valid LoRA weights inside. Proceeding with training. Error was: {e}")
-
+    if skip_if_hf_exists:
+        api = HfApi()
+        try:
+            info = api.repo_info(model_repo_id, repo_type="model")
+            print(f"\n[Skipping Training?] {model_repo_id} found on HF. Checking for adapter config...")
+            # This will try to load the adapter config and weights.
+            loaded_lora_model = PeftModel.from_pretrained(base_model, model_repo_id)
+            print(f"Found LoRA adapter in {model_repo_id}, skipping training.")
+            device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+            loaded_lora_model.to(device)
+            return loaded_lora_model
+        except (RepositoryNotFoundError, ValueError, OSError) as e:
+            print(f"HF repo {model_repo_id} found but no valid LoRA adapter inside (or missing adapter_config.json).")
+            print(f"Proceeding with training. Error was: {e}")
+    
     # --- Prepare model & LoRA ---
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     base_model.to(device)
@@ -228,7 +235,7 @@ def train_lora(base_model, dataset, tokenizer, model_repo_id, body_key="body", s
         evaluation_strategy="epoch",
         save_strategy="epoch",
         predict_with_generate=True,
-        num_train_epochs=2,
+        num_train_epochs=num_epochs,
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
         learning_rate=1e-4,
@@ -240,7 +247,7 @@ def train_lora(base_model, dataset, tokenizer, model_repo_id, body_key="body", s
         hub_strategy="end",
     )
 
-    trainer = Seq2SeqTrainer(
+    trainer = CustomSeq2SeqTrainer(
         model=lora_model,
         args=training_args,
         train_dataset=tokenized_ds["train"],
@@ -254,18 +261,15 @@ def train_lora(base_model, dataset, tokenizer, model_repo_id, body_key="body", s
     trainer.train()
     print("=== LoRA Fine-tuning done ===")
 
-    # -------------------------------
-    #   Save LoRA weights locally
-    #   (ensures adapter_config.json)
-    # -------------------------------
-    trainer.save_model()                        # Saves the entire model state to output_dir
-    lora_model.save_pretrained(training_args.output_dir)  # Ensures LoRA adapter files are included
+    # Save LoRA weights locally
+    trainer.save_model()
+    lora_model.save_pretrained(training_args.output_dir)
 
-    # Evaluate and return
     final_eval = trainer.evaluate(tokenized_ds["test"])
     print("Trainer Evaluate (test set):", final_eval)
 
     return lora_model
+
 
 #############################################################################
 #                                  MAIN
@@ -278,7 +282,7 @@ def main():
     model_name = "google/mt5-small"
     local_model_repo_id = "benitoals/my-lora-local"
     hf_model_repo_id    = "benitoals/my-lora-hf"
-    combined_repo_id    = "benitoals/my-lora-combined"
+    combined_repo_id    = "benitoals/my-lora-local-combined"
 
     # Decide which external HF dataset to use:
     # For the smaller dataset => "CShorten/ML-ArXiv-Papers"
