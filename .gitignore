@@ -219,3 +219,4 @@ benitoals/
 mt5-small-finetuned-amazon-en-es/
 local_pdf_dataset/
 course/en/chapter7/mt5-small-finetuned-amazon-en-es/
+model_lora_temp/
